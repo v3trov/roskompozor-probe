@@ -5,7 +5,9 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
 [ "$(uname -s)" = Linux ] || die 'Linux required.'
 [ "$(id -u)" = 0 ] || die 'Run this installer with sudo or as root.'
-[ -r /dev/tty ] && [ -w /dev/tty ] || die 'An interactive terminal is required for the API key.'
+if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    die 'An interactive terminal is required for the API key.'
+fi
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     init=systemd
 elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then

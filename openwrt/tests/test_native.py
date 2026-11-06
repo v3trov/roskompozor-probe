@@ -85,11 +85,11 @@ class NativeTests(unittest.TestCase):
         ca = cls.directory / 'ca.pem'
         key = cls.directory / 'key.pem'
         cert = cls.directory / 'cert.pem'
-        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(key), '-out', str(ca), '-days', '2', '-subj', '/CN=Probe Fixture CA'], check=True, capture_output=True)
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(key), '-out', str(ca), '-days', '2', '-subj', '/CN=Probe Fixture CA', '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign', '-addext', 'subjectKeyIdentifier=hash', '-addext', 'authorityKeyIdentifier=keyid:always'], check=True, capture_output=True)
         csr = cls.directory / 'csr.pem'
         subprocess.run(['openssl', 'req', '-new', '-key', str(key), '-out', str(csr), '-subj', '/CN=example.com'], check=True, capture_output=True)
         ext = cls.directory / 'ext.cnf'
-        ext.write_text('subjectAltName=DNS:example.com\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n')
+        ext.write_text('subjectAltName=DNS:example.com\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n')
         subprocess.run(['openssl', 'x509', '-req', '-in', str(csr), '-CA', str(ca), '-CAkey', str(key), '-CAcreateserial', '-out', str(cert), '-days', '1', '-extfile', str(ext)], check=True, capture_output=True)
         cls.env['SSL_CERT_FILE'] = str(ca)
         ping = cls.directory / 'ping'
@@ -141,7 +141,11 @@ class NativeTests(unittest.TestCase):
         values += [str(ipaddress.ip_address(rng.getrandbits(bits))) for bits in (32, 128) for _ in range(60)]
         for value in values:
             with self.subTest(value=value):
-                self.assertEqual(self.native('public', value), reference.public_ip(value))
+                # The native policy intentionally rejects mapped IPv6 addresses.
+                # Python 3.13+ changed their classification; do not relax the C guard.
+                mapped=getattr(ipaddress.ip_address(value),'ipv4_mapped',None)
+                expected=False if mapped is not None else reference.public_ip(value)
+                self.assertEqual(self.native('public', value), expected)
 
     def test_idna_normalization(self):
         for raw in ['EXAMPLE.COM.', ' пример.рф. ', 'faß.de', 'bücher.example', '2001:4860:4860::8888', '1.1.1.1', 'localhost', 'a..b', '-bad.com', 'bad-.com', 'a' * 64 + '.com', 'http://example.com', '123.999.1.1']:

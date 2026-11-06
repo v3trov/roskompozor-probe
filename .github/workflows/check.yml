@@ -8,3 +8,8 @@ jobs:
       - run: python3 -m unittest -v
       - run: sh -n install.sh
       - run: shellcheck -s sh install.sh
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libjson-c-dev libcurl4-openssl-dev libidn-dev
+      - run: sh openwrt/tests/run.sh
+      - run: sh -n openwrt/files/roskompozor-probe.init
+      - run: shellcheck -s sh openwrt/files/roskompozor-probe.init openwrt/tests/run.sh luci-app-roskompozor-probe/files/config-helper
+      - run: node openwrt/tests/test_luci.cjs

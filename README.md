@@ -21,3 +21,9 @@ OpenRC: `rc-service roskompozor-probe status`.
 
 Нестандартный init, Python старше 3.10 и контейнеры без необходимых прав ICMP
 не поддерживаются автоматически: установщик завершится с объяснением.
+
+## OpenWrt
+
+Нативный пакет для OpenWrt/RouteRich 24.10, aarch64_cortex-a53: [OpenWrt 1.0.1-r1](https://github.com/v3trov/roskompozor-probe/releases/tag/openwrt-v1.0.1-r1).
+Обновляется только пакет roskompozor-probe; существующий LuCI и config.json сохраняются.
+Исходники и сборка: [openwrt/](openwrt/).

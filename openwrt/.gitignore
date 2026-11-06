@@ -1,0 +1,5 @@
+/src/roskompozor-probe
+/src/roskompozor-probe.stripped
+/tests/harness
+/tests/netshim.so
+/tests/__pycache__/

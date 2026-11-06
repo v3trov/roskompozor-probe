@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+umask 077
+config_dir=/etc/roskompozor-probe
+service=/etc/init.d/roskompozor-probe
+[ "$#" = 1 ] || exit 2
+case "$1" in
+    save)
+        lock_dir=/var/lock/roskompozor-probe-config.lock
+        mkdir "$lock_dir" || { echo 'Settings are being saved by another session' >&2; exit 1; }
+        trap 'rmdir "$lock_dir"' EXIT
+        trap 'exit 1' HUP INT TERM
+        [ -f "$config_dir/config.pending" ] && [ ! -L "$config_dir/config.pending" ] || exit 1
+        [ ! -L "$config_dir/config.json" ] && [ ! -L "$config_dir/config.previous" ] || exit 1
+        /usr/bin/roskompozor-probe --validate-config "$config_dir/config.pending"
+        chmod 600 "$config_dir/config.pending"
+        if [ -f "$config_dir/config.json" ]; then
+            cp -p "$config_dir/config.json" "$config_dir/config.previous"
+            chmod 600 "$config_dir/config.previous"
+        fi
+        mv -f "$config_dir/config.pending" "$config_dir/config.json"
+        ;;
+    start|stop|restart|enable|disable) "$service" "$1" ;;
+    status) "$service" running >/dev/null 2>&1 && echo 1 || echo 0 ;;
+    enabled) "$service" enabled >/dev/null 2>&1 && echo 1 || echo 0 ;;
+    *) exit 2 ;;
+esac

@@ -1,0 +1,25 @@
+{
+  "luci-app-roskompozor-probe": {
+    "description": "Configure and control Roskompozor Probe only",
+    "read": {
+      "ubus": { "file": [ "read", "exec" ], "service": [ "list" ] },
+      "file": {
+        "/etc/roskompozor-probe/config.json": [ "read" ],
+        "/usr/libexec/roskompozor-probe-config status": [ "exec" ],
+        "/usr/libexec/roskompozor-probe-config enabled": [ "exec" ]
+      }
+    },
+    "write": {
+      "ubus": { "file": [ "write", "exec" ] },
+      "file": {
+        "/etc/roskompozor-probe/config.pending": [ "write" ],
+        "/usr/libexec/roskompozor-probe-config save": [ "exec" ],
+        "/usr/libexec/roskompozor-probe-config start": [ "exec" ],
+        "/usr/libexec/roskompozor-probe-config stop": [ "exec" ],
+        "/usr/libexec/roskompozor-probe-config restart": [ "exec" ],
+        "/usr/libexec/roskompozor-probe-config enable": [ "exec" ],
+        "/usr/libexec/roskompozor-probe-config disable": [ "exec" ]
+      }
+    }
+  }
+}

@@ -4,3 +4,7 @@ config.json
 __pycache__/
 *.pyc
 .env
+
+openwrt/src/roskompozor-probe
+openwrt/tests/harness
+openwrt/tests/netshim.so

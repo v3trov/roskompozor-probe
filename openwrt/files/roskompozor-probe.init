@@ -1,0 +1,30 @@
+#!/bin/sh /etc/rc.common
+# rc.common consumes these variables; OpenWrt uses BusyBox ash with local.
+# shellcheck disable=SC2034,SC3043
+USE_PROCD=1
+START=95
+STOP=10
+
+start_service() {
+    local config=/etc/roskompozor-probe/config.json
+    [ -s "$config" ] || return 1
+    if grep -q 'REPLACE_WITH_YOUR_NODE_API_KEY' "$config"; then
+        logger -t roskompozor-probe 'Set the node API key in config.json first'
+        return 1
+    fi
+    chmod 600 "$config"
+    procd_open_instance
+    procd_set_param command /usr/bin/roskompozor-probe "$config"
+    procd_set_param respawn 3600 10 5
+    procd_set_param term_timeout 15
+    procd_set_param nice 10
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param file "$config"
+    procd_close_instance
+}
+
+reload_service() {
+    stop
+    start
+}

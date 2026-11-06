@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 LOG = logging.getLogger("roskompozor-probe")
-USER_AGENT = "RoskompozorProbe/1.0"
+USER_AGENT = "RoskompozorProbe/1.0.1"
 MAX_REDIRECTS = 5
 MAX_HEADER_BYTES = 65536
 
@@ -101,30 +101,42 @@ def parse_url(url: str) -> tuple[str,str,int,str]:
     if port not in (80,443): raise ValueError("unsafe port")
     host=normalize_host(parts.hostname);path=urllib.parse.urlunsplit(("","",parts.path or "/",parts.query,""));return parts.scheme,host,port,path
 
-def http_once(url: str,timeout: float) -> dict[str,Any]:
+def remaining_timeout(deadline: float,cap: float) -> float:
+    remaining=deadline-time.monotonic()
+    if remaining<=0: raise TimeoutError('HTTP deadline exceeded')
+    return min(cap,remaining)
+
+def http_once(url: str,timeout: float,deadline: float|None=None) -> dict[str,Any]:
+    deadline=min(deadline if deadline is not None else float('inf'),time.monotonic()+timeout)
     scheme,host,port,path=parse_url(url);addresses=resolve_public(host);last=None
     for ip in addresses:
-        started=time.monotonic()
+        started=time.monotonic();connection=None
         try:
-            connection=socket.create_connection((ip,port),timeout=timeout)
+            connection=socket.create_connection((ip,port),timeout=remaining_timeout(deadline,timeout))
+            connection.settimeout(remaining_timeout(deadline,timeout))
             if scheme=="https": connection=ssl.create_default_context().wrap_socket(connection,server_hostname=host)
             host_header=f"[{host}]" if ":" in host else host
-            request=f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n\r\n";connection.sendall(request.encode("ascii"));data=b""
+            request=f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n\r\n";connection.settimeout(remaining_timeout(deadline,timeout));connection.sendall(request.encode("ascii"));data=b""
             while b"\r\n\r\n" not in data and len(data)<MAX_HEADER_BYTES:
+                connection.settimeout(remaining_timeout(deadline,timeout))
                 chunk=connection.recv(4096)
                 if not chunk: break
                 data+=chunk
-            connection.close();header=data.split(b"\r\n\r\n",1)[0].decode("iso-8859-1");lines=header.split("\r\n")
+            header=data.split(b"\r\n\r\n",1)[0].decode("iso-8859-1");lines=header.split("\r\n")
             if not lines or len(lines[0].split())<2: raise ValueError("invalid HTTP response")
             status=int(lines[0].split()[1]);headers={key.strip().lower():value.strip() for key,value in (line.split(":",1) for line in lines[1:] if ":" in line)}
             return {"ok":True,"status":status,"ms":round((time.monotonic()-started)*1000),"ip":ip,"location":headers.get("location")}
-        except Exception as exc: last={"ok":False,"status":0,"ms":round((time.monotonic()-started)*1000),"ip":ip,"error_type":error_type(exc),"error":safe_error(exc)}
+        except Exception as exc:
+            last={"ok":False,"status":0,"ms":round((time.monotonic()-started)*1000),"ip":ip,"error_type":error_type(exc),"error":safe_error(exc)}
+            if time.monotonic()>=deadline: break
+        finally:
+            if connection is not None: connection.close()
     return last or {"ok":False,"status":0,"ms":0,"error_type":"network error","error":"No public address"}
 
 def http_chain(initial: str,timeout: float) -> dict[str,Any]:
-    url=initial;chain=[]
+    url=initial;chain=[];deadline=time.monotonic()+timeout*(MAX_REDIRECTS+1)
     for redirect_count in range(MAX_REDIRECTS+1):
-        result=http_once(url,timeout);result["url"]=url;chain.append(result);location=result.get("location")
+        result=http_once(url,timeout,deadline);result["url"]=url;chain.append(result);location=result.get("location")
         if not location or result.get("status") not in (301,302,303,307,308): break
         if redirect_count>=MAX_REDIRECTS: break
         url=urllib.parse.urljoin(url,location);parse_url(url)

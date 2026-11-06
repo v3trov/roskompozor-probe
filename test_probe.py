@@ -32,7 +32,7 @@ class ProbeTests(unittest.TestCase):
         root = pathlib.Path(__file__).parent
         installer = (root / 'install.sh').read_bytes()
         embedded = installer.split(b"<<'PROBE_SOURCE'\n", 1)[1].split(b'\nPROBE_SOURCE\n', 1)[0]
-        self.assertEqual(embedded, (root / 'roskompozor_probe.py').read_bytes())
+        self.assertEqual(embedded + b'\n', (root / 'roskompozor_probe.py').read_bytes())
 
 
 if __name__ == '__main__':

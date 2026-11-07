@@ -24,6 +24,11 @@ OpenRC: `rc-service roskompozor-probe status`.
 
 ## OpenWrt
 
-Нативный пакет для OpenWrt/RouteRich 24.10, aarch64_cortex-a53: [OpenWrt 1.0.1-r1](https://github.com/v3trov/roskompozor-probe/releases/tag/openwrt-v1.0.1-r1).
-Обновляется только пакет roskompozor-probe; существующий LuCI и config.json сохраняются.
-Исходники и сборка: [openwrt/](openwrt/).
+Эта ветка `codex/openwrt-25.12` содержит APK для OpenWrt/RouteRich 25.12.6,
+mediatek/filogic, aarch64_cortex-a53:
+[OpenWrt 25.12, Probe 1.0.2-r1](https://github.com/v3trov/roskompozor-probe/releases/tag/openwrt-25.12-v1.0.2-r1).
+Устанавливаются основной пакет и соответствующий LuCI.
+Исходники, ресурсы и прямые проверки: [openwrt/](openwrt/).
+Команды установки: [openwrt/UPDATE.md](openwrt/UPDATE.md).
+
+Ветка `main` и прежний [IPK для 24.10](https://github.com/v3trov/roskompozor-probe/releases/tag/openwrt-v1.0.1-r1) сохраняются отдельно.

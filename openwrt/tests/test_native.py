@@ -89,7 +89,7 @@ class NativeTests(unittest.TestCase):
         csr = cls.directory / 'csr.pem'
         subprocess.run(['openssl', 'req', '-new', '-key', str(key), '-out', str(csr), '-subj', '/CN=example.com'], check=True, capture_output=True)
         ext = cls.directory / 'ext.cnf'
-        ext.write_text('subjectAltName=DNS:example.com\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n')
+        ext.write_text('subjectAltName=DNS:example.com,DNS:roskompozor.ru,DNS:cloudflare-dns.com\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n')
         subprocess.run(['openssl', 'x509', '-req', '-in', str(csr), '-CA', str(ca), '-CAkey', str(key), '-CAcreateserial', '-out', str(cert), '-days', '1', '-extfile', str(ext)], check=True, capture_output=True)
         cls.env['SSL_CERT_FILE'] = str(ca)
         ping = cls.directory / 'ping'
@@ -275,14 +275,72 @@ class NativeTests(unittest.TestCase):
         config = dict(server='https://roskompozor.ru/', api_key='x' * 68, poll_interval=1, request_timeout=100, max_parallel_checks=100)
         path.write_text(json.dumps(config))
         actual = self.native('config', path)
-        expected = reference.load_config(path)
-        expected.pop('api_key')
-        expected['server'] = expected['server'].rstrip('/')
-        self.assertEqual(actual, expected)
+        self.assertNotIn('server', actual)
+        self.assertEqual(actual['poll_interval'], 15)
+        self.assertEqual(actual['request_timeout'], 60)
+        self.assertEqual(actual['max_parallel_checks'], 1)
         for server in ['file:///etc/passwd', 'https://user:pass@example.com']:
             config['server'] = server
             path.write_text(json.dumps(config))
-            self.assertIn('error', self.native('config', path))
+            self.assertNotIn('server', self.native('config', path))
+        config.pop('server')
+        path.write_text(json.dumps(config))
+        self.assertNotIn('error', self.native('config', path))
+
+    def test_poll_backoff(self):
+        self.assertEqual(self.native('delay', 30, 0, 0), 30)
+        delay = 0
+        for expected in (30, 60, 120, 240, 300, 300):
+            delay = self.native('delay', 30, 1, delay)
+            self.assertEqual(delay, expected)
+        self.assertEqual(self.native('delay', 30, 0, delay), 30)
+        self.assertEqual(self.native('delay', 600, 1, 600), 600)
+
+    def test_direct_doh_validation_and_mark_failure(self):
+        records = ['1.1.1.1', '8.8.8.8']
+        calls = []
+        status, ttl = 0, 60
+        class Dns(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                calls.append(self.path)
+                kind = int(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)['type'][0])
+                data = {'Status': status, 'Answer': [dict(type=1, data=ip, TTL=ttl) for ip in records] if kind == 1 else []}
+                encoded = json.dumps(data).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+            def log_message(self, *args): pass
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Dns)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.directory / 'cert.pem', self.directory / 'key.pem')
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        env = dict(self.env, FIXTURE_PORTS=f'443:{server.server_port}', FIXTURE_MARK='ok')
+        try:
+            self.assertEqual(self.native('direct-resolve', 'example.com', env=env)['addresses'], records)
+            self.assertEqual(len(calls), 2)
+            calls.clear()
+            self.assertTrue(self.native('direct-cache', 'example.com', env=env)['ok'])
+            self.assertEqual(len(calls), 2)
+            ttl = 0
+            calls.clear()
+            self.assertTrue(self.native('direct-cache', 'example.com', env=env)['ok'])
+            self.assertEqual(len(calls), 4)
+            status = 3
+            self.assertEqual(self.native('direct-resolve', 'example.com', env=env)['error_type'], 'DNS error')
+            status = 0
+            records[:] = ['1.1.1.1', '8.8.8.8', '9.9.9.9', '11.0.0.1', '198.18.0.1']
+            self.assertEqual(self.native('direct-resolve', 'example.com', env=env)['error_type'], 'HTTP error')
+            records[:] = ['not-an-ip']
+            self.assertEqual(self.native('direct-resolve', 'example.com', env=env)['error_type'], 'DNS error')
+            calls.clear()
+            env['FIXTURE_MARK'] = 'fail'
+            self.assertEqual(self.native('direct-resolve', 'example.com', env=env)['error_type'], 'DNS error')
+            self.assertEqual(calls, [])
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_api_roundtrip_and_parallel_checks(self):
         captured = []
@@ -297,6 +355,9 @@ class NativeTests(unittest.TestCase):
                 self.wfile.write(encoded)
 
             def do_GET(self):
+                if self.path != '/api/probe/checks':
+                    self.respond({})
+                    return
                 captured.append((self.path, self.headers.get('Authorization')))
                 self.respond({'checks': jobs})
 
@@ -309,13 +370,16 @@ class NativeTests(unittest.TestCase):
                 pass
 
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Api)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.directory / 'cert.pem', self.directory / 'key.pem')
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             key = 'fixture_key_' + '0' * 64
-            config = dict(server=f'http://127.0.0.1:{server.server_port}', api_key=key, poll_interval=5, request_timeout=10, max_parallel_checks=2)
+            config = dict(server=f'http://127.0.0.1:{server.server_port}', api_key=key, poll_interval=5, request_timeout=10, max_parallel_checks=2, direct_mode=False)
             path = self.directory / 'api.json'
             path.write_text(json.dumps(config))
-            env = dict(self.env, FIXTURE_PORTS=self.env['FIXTURE_PORTS'] + f',{server.server_port}:{server.server_port}')
+            env = dict(self.env, FIXTURE_PORTS=self.env['FIXTURE_PORTS'] + f',443:{server.server_port}', CURL_CA_BUNDLE=self.env['SSL_CERT_FILE'])
             process = subprocess.run([str(NATIVE), '--once', str(path)], env=env, capture_output=True, text=True, timeout=30, check=True)
             self.assertIn('accepted=3', process.stderr)
             self.assertNotIn(key, process.stderr + process.stdout)

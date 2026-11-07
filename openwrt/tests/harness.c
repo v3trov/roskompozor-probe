@@ -11,6 +11,9 @@ int main(int argc,char **argv) {
     else if(argc==3&&!strcmp(argv[1],"chain")) { r=http_chain(argv[2],2,&e);if(!r){r=json_object_new_object();add_error(r,&e);} }
     else if(argc==3&&!strcmp(argv[1],"config")) { r=load_config(argv[2]);if(!r){r=json_object_new_object();str(r,"error","invalid config");}else json_object_object_del(r,"api_key"); }
     else if(argc==3&&!strcmp(argv[1],"tls")) { Addresses a;if(resolve_public(argv[2],&a,&e))r=technical(&e,now_ms());else r=tls_check(argv[2],&a,2); }
+    else if(argc==5&&!strcmp(argv[1],"delay")) { r=json_object_new_int(poll_delay(atoi(argv[2]),atoi(argv[3]),atoi(argv[4]))); }
+    else if(argc==3&&!strcmp(argv[1],"direct-resolve")) { direct_mode=true;Addresses a;r=json_object_new_object();if(resolve_public(argv[2],&a,&e))add_error(r,&e);else {J *list=json_object_new_array();for(int i=0;i<a.count;i++)json_object_array_add(list,json_object_new_string(a.ip[i]));put(r,"addresses",list);} }
+    else if(argc==3&&!strcmp(argv[1],"direct-cache")) { direct_mode=true;Addresses a,b;r=json_object_new_object();if(resolve_public(argv[2],&a,&e)||resolve_public(argv[2],&b,&e))add_error(r,&e);else boolean(r,"ok",a.count==b.count); }
     else return 2;
     puts(json_object_to_json_string_ext(r,JSON_C_TO_STRING_PLAIN));json_object_put(r);SSL_CTX_free(tls_context);curl_global_cleanup();return 0;
 }

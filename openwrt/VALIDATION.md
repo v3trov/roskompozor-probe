@@ -1,3 +1,44 @@
+# OpenWrt 25.12: 1.0.2-r1, 7 November 2026
+
+* Official SDK: OpenWrt 25.12.6 mediatek/filogic, GCC 14.3.0, musl.
+  Downloaded SDK SHA-256 verified against the official release index:
+  `1c04ac47bdfc361d6aab299eb520d570e368013dedcb8d29cf39dc7168ae642e`.
+* 20 host native tests passed. They cover the previous measurement contract,
+  slow HTTP/HTTPS headers, fixed-origin verified-HTTPS API roundtrips,
+  config limits, retry bounds, DoH cache/TTL, invalid DNS/FakeIP answers after
+  the first four addresses, and failure to set the bypass socket mark.
+* LuCI tests passed: no server/parallelism controls; API key remains masked;
+  saving drops legacy server overrides, preserves api_connect_ip and unknown
+  settings, forces one target, retains atomic validation/save and narrow ACLs.
+* Shell syntax and shellcheck passed for init, config helper and installer.
+* Payload inspection: ELF AArch64; config mode 0600, placeholder key only;
+  direct_mode true, poll interval 30, one target. Packaged LuCI matches source.
+  The final compiled C source matches this branch.
+* Final binary SHA-256:
+  `8e0eba571cd91b7b9e58512746be431062269b1d5eeb684420b4011435c29ab5`.
+  Exactly this binary was run on a physical Routerich AX3000 v1,
+  RouteRich 25.12.6 RR-4.6.4, kernel 6.12.112, using temporary files only.
+* Physical direct checks: example.com and api.telegram.org. Local DNS returned
+  FakeIP 198.18.0.30 for api.telegram.org, while Probe DoH returned public
+  149.154.166.110 and 2001:67c:4e8:f004::9. The local ZeroBlock bypass rule's
+  counter increased from 170 to 259 packets during the two runs.
+* example.com: verified TLS and HTTP/HTTPS 200. CPU user/system 0.21/0.01 s,
+  wall time 0.95 s, maximum RSS 9396 KiB. api.telegram.org: DNS/ICMP/TCP replied,
+  TLS and HTTP/HTTPS timed out; those errors remain technical observations,
+  not a blocking verdict. CPU user/system 0.16/0.02 s, wall 6.46 s, RSS 9052 KiB.
+  These are two one-shot measurements, not long-term daemon/load benchmarks.
+* No packet capture was made on the upstream router. Its exclusion was added
+  by the owner; local mark handling and public DNS were independently tested.
+* Both final APKs passed apk add --simulate on the physical router. The solver
+  needs only iputils-ping, libidn and the two Probe packages; no system library
+  replacements. After simulation, Probe/config remained absent.
+* All temporary router test files were removed. No Probe service, routes,
+  firewall, ZeroBlock, DNS or system library configuration was installed/changed.
+  Authenticated production polling awaits owner installation and a separate
+  node key. HTTPS API roundtrips were tested against local fixtures.
+
+The previous release validations below are historical and target 24.10.
+
 # Версия 1.0.1-r1, 6 ноября 2026
 
 - Собрана официальным SDK OpenWrt 24.10.6 mediatek/filogic, aarch64_cortex-a53.

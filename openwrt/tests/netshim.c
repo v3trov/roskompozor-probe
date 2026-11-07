@@ -7,12 +7,31 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <curl/curl.h>
+
+int setsockopt(int fd,int level,int option,const void *value,socklen_t length) {
+    int (*real)(int,int,int,const void *,socklen_t)=dlsym(RTLD_NEXT,"setsockopt");
+    if(level==SOL_SOCKET&&option==SO_MARK&&getenv("FIXTURE_MARK")) {
+        if(length!=sizeof(int)||*(const int *)value!=0x20000||!strcmp(getenv("FIXTURE_MARK"),"fail")){errno=EPERM;return -1;}
+        return 0;
+    }
+    return real(fd,level,option,value,length);
+}
+
+/* Trust only the local fixture CA during API roundtrips. */
+CURLcode curl_easy_perform(CURL *handle) {
+    CURLcode (*setopt)(CURL *,CURLoption,...)=dlsym(RTLD_NEXT,"curl_easy_setopt");
+    CURLcode (*perform)(CURL *)=dlsym(RTLD_NEXT,"curl_easy_perform");
+    const char *ca=getenv("SSL_CERT_FILE");
+    if(ca)setopt(handle,CURLOPT_CAINFO,ca);
+    return perform(handle);
+}
 
 /* TEST ONLY. Routes public fixtures to local test servers. Never linked into
  * the installed probe; production does not accept fixture environment vars. */
 int getaddrinfo(const char *name,const char *service,const struct addrinfo *hints,struct addrinfo **out) {
     int (*real)(const char *,const char *,const struct addrinfo *,struct addrinfo **)=dlsym(RTLD_NEXT,"getaddrinfo");
-    const char *answers=getenv("FIXTURE_DNS");if(!answers||!name||(!strstr(name,"example")&&!strstr(name,"xn--")))return real(name,service,hints,out);
+    const char *answers=getenv("FIXTURE_DNS");if(!answers||!name||(!strstr(name,"example")&&!strstr(name,"xn--")&&!strstr(name,"roskompozor.ru")))return real(name,service,hints,out);
     if(!strcmp(answers,"FAIL"))return EAI_NONAME;
     char *list=strdup(answers),*cursor=NULL;struct addrinfo *head=NULL,*tail=NULL;
     for(char *ip=strtok_r(list,",",&cursor);ip;ip=strtok_r(NULL,",",&cursor)) {

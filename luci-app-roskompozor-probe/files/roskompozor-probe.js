@@ -40,29 +40,16 @@ return view.extend({
         o.validate = function(section, value) {
             return /^rkp_[a-fA-F0-9]{64}$/.test(value) ? true : 'Ключ должен начинаться с rkp_ и содержать 64 шестнадцатеричных символа.';
         };
-        o = s.option(form.Value, 'server', 'Адрес сервера');
-        o.rmempty = false;
-        o.validate = function(section, value) {
-            try {
-                var url = new URL(value);
-                return url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash ? true : 'Укажите HTTPS-адрес без логина, пароля, query и fragment.';
-            }
-            catch (error) { return 'Укажите корректный HTTPS-адрес сервера.'; }
-        };
         o = s.option(form.Value, 'api_connect_ip', 'IP для подключения к API');
         o.datatype = 'ipaddr';
         o.rmempty = true;
         o.description = 'Необязательно. Если сервер находится за этим роутером, укажите его локальный IP. Имя и TLS-сертификат проверяются по адресу сервера; проверки целей используют обычный DNS.';
         o = s.option(form.Value, 'poll_interval', 'Интервал опроса, секунд');
-        o.datatype = 'and(uinteger,range(5,3600))';
+        o.datatype = 'and(uinteger,range(15,3600))';
         o.rmempty = false;
         o = s.option(form.Value, 'request_timeout', 'Таймаут API, секунд');
         o.datatype = 'range(2,60)';
         o.rmempty = false;
-        o = s.option(form.Value, 'max_parallel_checks', 'Одновременных целей');
-        o.datatype = 'and(uinteger,range(1,20))';
-        o.rmempty = false;
-        o.description = '1 — минимальный расход памяти. Порты и HTTP/HTTPS внутри цели проверяются параллельно.';
         o = s.option(form.Flag, 'enabled', 'Запускать при включении роутера');
         o.rmempty = false;
 
@@ -96,12 +83,12 @@ return view.extend({
             var values = self.map.data.get('json', 'probe');
             var config = Object.assign({}, self.original, {
                 api_key: values.api_key,
-                server: values.server.replace(/\/+$/, ''),
                 api_connect_ip: values.api_connect_ip || '',
                 poll_interval: Number(values.poll_interval),
                 request_timeout: Number(values.request_timeout),
-                max_parallel_checks: Number(values.max_parallel_checks)
+                max_parallel_checks: 1
             });
+            delete config.server;
             return fs.write(pendingPath, JSON.stringify(config, null, 2) + '\n', 384)
                 .then(function() { return command('save'); })
                 .then(function() { return command(values.enabled === '1' ? 'enable' : 'disable'); })

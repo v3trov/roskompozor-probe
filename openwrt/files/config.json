@@ -1,7 +1,7 @@
 {
-  "server": "https://roskompozor.ru",
   "api_key": "REPLACE_WITH_YOUR_NODE_API_KEY",
-  "poll_interval": 10,
+  "poll_interval": 30,
   "request_timeout": 10,
-  "max_parallel_checks": 1
+  "max_parallel_checks": 1,
+  "direct_mode": true
 }

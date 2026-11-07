@@ -30,7 +30,8 @@
 #include <openssl/x509v3.h>
 
 /* Measurement contract: upstream 422141a. No shell executes target input. */
-#define UA "RoskompozorProbe/1.0.1"
+#define UA "RoskompozorProbe/1.0.2"
+#define API_ORIGIN "https://roskompozor.ru"
 #define HEADER_LIMIT 65536
 #define API_LIMIT 1048576
 #define URL_LIMIT 8192
@@ -42,6 +43,14 @@ typedef struct { char ip[MAX_ADDR][INET6_ADDRSTRLEN]; int count; } Addresses;
 typedef struct { int tls, port; char host[254], path[URL_LIMIT]; } Url;
 static SSL_CTX *tls_context;
 static volatile sig_atomic_t stopping;
+static bool direct_mode;
+static CURL *api_curl,*dns_curl;
+static pthread_mutex_t dns_lock=PTHREAD_MUTEX_INITIALIZER;
+#define DIRECT_MARK 0x20000
+static int mark_socket(int fd) { int mark=DIRECT_MARK;return direct_mode?setsockopt(fd,SOL_SOCKET,SO_MARK,&mark,sizeof(mark)):0; }
+static int curl_mark(void *unused,curl_socket_t fd,curlsocktype purpose) { (void)unused;(void)purpose;return mark_socket(fd)?CURL_SOCKOPT_ERROR:CURL_SOCKOPT_OK; }
+static int doh_resolve(const char *host,Addresses *out,Error *e);
+
 
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1000.0+t.tv_nsec/1000000.0; }
 static int elapsed(double start) { return (int)nearbyint(now_ms()-start); }
@@ -108,6 +117,7 @@ static int resolve_public(const char *host,Addresses *out,Error *e) {
         if(!public_ip(host)){error_set(e,"HTTP error","target resolved to a non-public address");return -1;}
         snprintf(out->ip[0],sizeof(out->ip[0]),"%s",host);out->count=1;return 0;
     }
+    if(direct_mode)return doh_resolve(host,out,e);
     struct addrinfo hints={0},*list=NULL;hints.ai_socktype=SOCK_STREAM;
     int code=getaddrinfo(host,NULL,&hints,&list);if(code){error_set(e,"DNS error",gai_strerror(code));return -1;}
     /* Validate ALL answers before selecting four, including duplicates. */
@@ -137,6 +147,7 @@ static int connect_ip(const char *ip,int port,double timeout,Error *e) {
     if(af==AF_INET){struct sockaddr_in *a=(void *)&address;a->sin_family=AF_INET;a->sin_port=htons((uint16_t)port);inet_pton(af,ip,&a->sin_addr);len=sizeof(*a);}
     else {struct sockaddr_in6 *a=(void *)&address;a->sin6_family=AF_INET6;a->sin6_port=htons((uint16_t)port);inet_pton(af,ip,&a->sin6_addr);len=sizeof(*a);}
     int fd=socket(af,SOCK_STREAM|SOCK_CLOEXEC,0);if(fd<0){os_error(e,errno);return -1;}
+    if(mark_socket(fd)){os_error(e,errno);close(fd);return -1;}
     fcntl(fd,F_SETFD,FD_CLOEXEC);fcntl(fd,F_SETFL,O_NONBLOCK);
     if(connect(fd,(void *)&address,len)<0) {
         if(errno!=EINPROGRESS){os_error(e,errno);close(fd);return -1;}
@@ -208,10 +219,13 @@ static J *ping_check(const char *ip,double timeout) {
     char seconds[16];snprintf(seconds,sizeof(seconds),"%d",(int)fmax(1,(int)(timeout+0.999)));
     char *argv4[]={"ping","-n","-c","1","-W",seconds,(char *)ip,NULL};
     char *argv6[]={"ping","-6","-n","-c","1","-W",seconds,(char *)ip,NULL};
+    char *marked4[]={"ping","-m","131072","-n","-c","1","-W",seconds,(char *)ip,NULL};
+    char *marked6[]={"ping","-6","-m","131072","-n","-c","1","-W",seconds,(char *)ip,NULL};
+    char **args=direct_mode?(strchr(ip,':')?marked6:marked4):(strchr(ip,':')?argv6:argv4);
     posix_spawn_file_actions_t actions;posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions,pipes[1],STDOUT_FILENO);posix_spawn_file_actions_adddup2(&actions,pipes[1],STDERR_FILENO);
     posix_spawn_file_actions_addclose(&actions,pipes[0]);posix_spawn_file_actions_addclose(&actions,pipes[1]);
-    pid_t pid;int rc=posix_spawnp(&pid,"ping",&actions,NULL,strchr(ip,':')?argv6:argv4,environ);
+    pid_t pid;int rc=posix_spawnp(&pid,"ping",&actions,NULL,args,environ);
     posix_spawn_file_actions_destroy(&actions);close(pipes[1]);
     if(rc){close(pipes[0]);J *r=measurement(false,rc==ENOENT?0:elapsed(started),ip);
         if(rc==ENOENT){str(r,"error_type","unavailable");str(r,"error","ping utility is unavailable");}else{os_error(&e,rc);add_error(r,&e);}return r;}
@@ -316,6 +330,8 @@ static int start_thread(pthread_t *thread,void *(*worker)(void *),void *task) {
 static J *run_check(J *item,double timeout) {
     double started=now_ms();Error e={0};char host[254];J *dns=NULL,*ping=NULL,*tcp=NULL,*tls=NULL,*http=NULL,*https=NULL;
     if(normalize_host(textval(item,"target"),host,&e))return technical(&e,started);
+    /* Check mark permission before spawning ICMP or contacting the target. */
+    if(direct_mode){int fd=socket(AF_INET,SOCK_DGRAM|SOCK_CLOEXEC,0);if(fd<0){os_error(&e,errno);return technical(&e,started);}int rc=mark_socket(fd),saved=errno;close(fd);if(rc){os_error(&e,saved);return technical(&e,started);}}
     const char *expected=public_ip(host)?"ip":"domain";if(strcmp(textval(item,"type"),expected)){error_set(&e,"HTTP error","target type mismatch");return technical(&e,started);}
     int ports[MAX_PORTS]={80,443},nports=2;J *raw=get(item,"ports");J *ignored=NULL;bool ports_present=json_object_object_get_ex(item,"ports",&ignored);
     if(ports_present&&(!json_object_is_type(raw,json_type_array)||json_object_array_length(raw)>8)){error_set(&e,"HTTP error","invalid ports");return technical(&e,started);}
@@ -339,9 +355,9 @@ static J *run_check(J *item,double timeout) {
     J *r=json_object_new_object();boolean(r,"ok",ok);str(r,"target_type",expected);str(r,"summary",ok?"Узел получил сетевой ответ":"Ответ на проверенные запросы не получен");put(r,"dns",dns);put(r,"ping",ping);put(r,"tcp",tcp);put(r,"tls",tls);put(r,"http",http);put(r,"https",https);num(r,"total_ms",elapsed(started));return r;
 }
 
-typedef struct { char *data;size_t length; } Buffer;
+typedef struct { char *data;size_t length,limit; } Buffer;
 static size_t api_write(char *data,size_t size,size_t count,void *user) {
-    Buffer *b=user;if(size&&count>SIZE_MAX/size)return 0;size_t n=size*count;if(n>API_LIMIT-b->length)return 0;
+    Buffer *b=user;if(size&&count>SIZE_MAX/size)return 0;size_t n=size*count;size_t limit=b->limit?b->limit:API_LIMIT;if(n>limit-b->length)return 0;
     char *p=realloc(b->data,b->length+n+1);if(!p)return 0;b->data=p;memcpy(p+b->length,data,n);b->length+=n;p[b->length]=0;return n;
 }
 static J *parse_json(const char *data,size_t size) {
@@ -349,16 +365,72 @@ static J *parse_json(const char *data,size_t size) {
     if(json_tokener_get_error(tok)!=json_tokener_success){if(o)json_object_put(o);o=NULL;}
     json_tokener_free(tok);return o;
 }
+/* Eight positive answers, at most 60 seconds and never beyond DNS TTL.
+ * Serialize the small resolver cache and reuse its TLS connection. */
+typedef struct { char host[254];Addresses addresses;double expires; } DnsCache;
+static DnsCache dns_cache[8];
+static unsigned dns_slot;
+static int doh_collect(J *reply,Addresses *out,int type,int *ttl,Error *e) {
+    J *status=get(reply,"Status"),*answers=get(reply,"Answer");
+    if(!json_object_is_type(status,json_type_int)||json_object_get_int(status)!=0)goto bad;
+    if(!answers)return 0;
+    if(!json_object_is_type(answers,json_type_array))goto bad;
+    for(size_t k=0;k<json_object_array_length(answers);k++) {
+        J *a=json_object_array_get_idx(answers,k),*kind=get(a,"type");
+        if(!json_object_is_type(a,json_type_object)||!json_object_is_type(kind,json_type_int))goto bad;
+        J *life=get(a,"TTL");int life_seconds=json_object_is_type(life,json_type_int)?json_object_get_int(life):0;
+        if(life_seconds<*ttl)*ttl=life_seconds>0?life_seconds:0;
+        int t=json_object_get_int(kind);if(t!=1&&t!=28)continue;
+        const char *ip=textval(a,"data");unsigned char bin[16];
+        if(t!=type||inet_pton(t==1?AF_INET:AF_INET6,ip,bin)!=1)goto bad;
+        char canonical[INET6_ADDRSTRLEN];inet_ntop(t==1?AF_INET:AF_INET6,bin,canonical,sizeof(canonical));ip=canonical;
+        if(!public_ip(ip)){error_set(e,"HTTP error","target resolved to a non-public address");return -1;}
+        bool duplicate=false;for(int i=0;i<out->count;i++)if(!strcmp(out->ip[i],ip))duplicate=true;
+        if(duplicate)continue;
+        if(out->count<MAX_ADDR)snprintf(out->ip[out->count++],sizeof(out->ip[0]),"%s",ip);
+        else if(strcmp(ip,out->ip[out->count-1])<0)snprintf(out->ip[out->count-1],sizeof(out->ip[0]),"%s",ip);
+        qsort(out->ip,(size_t)out->count,sizeof(out->ip[0]),cmp_ip);
+    }return 0;
+bad:error_set(e,"DNS error","Invalid or unsuccessful DoH response");return -1;
+}
+static int doh_resolve(const char *host,Addresses *out,Error *e) {
+    int rc=-1,ttl=60;out->count=0;pthread_mutex_lock(&dns_lock);double started=now_ms();
+    for(int i=0;i<8;i++)if(!strcmp(dns_cache[i].host,host)&&dns_cache[i].expires>now_ms()){*out=dns_cache[i].addresses;rc=0;goto done;}
+    if(!dns_curl)dns_curl=curl_easy_init();if(!dns_curl)goto failed;
+    for(int q=0;q<2;q++) {
+        int type=q?28:1;char url[512];Buffer buffer={.limit=65536};
+        snprintf(url,sizeof(url),"https://cloudflare-dns.com/dns-query?name=%s&type=%d",host,type);
+        struct curl_slist *headers=curl_slist_append(NULL,"Accept: application/dns-json");
+        struct curl_slist *resolve=curl_slist_append(NULL,"cloudflare-dns.com:443:1.1.1.1");
+        if(!headers||!resolve){curl_slist_free_all(headers);curl_slist_free_all(resolve);goto failed;}
+        curl_easy_reset(dns_curl);
+        curl_easy_setopt(dns_curl,CURLOPT_URL,url);curl_easy_setopt(dns_curl,CURLOPT_RESOLVE,resolve);
+        curl_easy_setopt(dns_curl,CURLOPT_HTTPHEADER,headers);curl_easy_setopt(dns_curl,CURLOPT_PROXY,"");
+        curl_easy_setopt(dns_curl,CURLOPT_TIMEOUT_MS,5000L);curl_easy_setopt(dns_curl,CURLOPT_CONNECTTIMEOUT_MS,3000L);
+        curl_easy_setopt(dns_curl,CURLOPT_WRITEFUNCTION,api_write);curl_easy_setopt(dns_curl,CURLOPT_WRITEDATA,&buffer);
+        curl_easy_setopt(dns_curl,CURLOPT_SOCKOPTFUNCTION,curl_mark);curl_easy_setopt(dns_curl,CURLOPT_NOSIGNAL,1L);
+        curl_easy_setopt(dns_curl,CURLOPT_PROTOCOLS_STR,"https");curl_easy_setopt(dns_curl,CURLOPT_FOLLOWLOCATION,0L);
+        CURLcode code=curl_easy_perform(dns_curl);long status=0;curl_easy_getinfo(dns_curl,CURLINFO_RESPONSE_CODE,&status);
+        J *reply=code==CURLE_OK&&status==200&&buffer.data?parse_json(buffer.data,buffer.length):NULL;
+        free(buffer.data);curl_slist_free_all(headers);curl_slist_free_all(resolve);
+        if(!reply)goto failed;
+        int result=doh_collect(reply,out,type,&ttl,e);json_object_put(reply);if(result)goto done;
+    }
+    if(!out->count){error_set(e,"DNS error","DNS returned no addresses");goto done;}
+    DnsCache *entry=&dns_cache[dns_slot++%8];snprintf(entry->host,sizeof(entry->host),"%s",host);entry->addresses=*out;entry->expires=started+ttl*1000.0;rc=0;goto done;
+failed:error_set(e,"DNS error","Direct DoH request failed");
+done:pthread_mutex_unlock(&dns_lock);return rc;
+}
 static J *api_request(J *config,const char *path,J *payload) {
-    char url[URL_LIMIT],authorization[256];if(snprintf(url,sizeof(url),"%s%s",textval(config,"server"),path)>=(int)sizeof(url))return NULL;
-    snprintf(authorization,sizeof(authorization),"Authorization: Bearer %s",textval(config,"api_key"));CURL *curl=curl_easy_init();Buffer buffer={0};struct curl_slist *headers=NULL,*resolve=NULL;
+    char url[URL_LIMIT],authorization[256];if(snprintf(url,sizeof(url),"%s%s",API_ORIGIN,path)>=(int)sizeof(url))return NULL;
+    snprintf(authorization,sizeof(authorization),"Authorization: Bearer %s",textval(config,"api_key"));if(!api_curl)api_curl=curl_easy_init();CURL *curl=api_curl;if(!curl)return NULL;curl_easy_reset(curl);Buffer buffer={0};struct curl_slist *headers=NULL,*resolve=NULL;
     /* API transport override only: retain URL hostname, SNI and TLS verification. */
-    const char *connect_ip=textval(config,"api_connect_ip");
-    if(*connect_ip){CURLU *u=curl_url();char *host=NULL,*port=NULL;char entry[512];
-        if(curl_url_set(u,CURLUPART_URL,url,0)==CURLUE_OK&&curl_url_get(u,CURLUPART_HOST,&host,0)==CURLUE_OK&&curl_url_get(u,CURLUPART_PORT,&port,CURLU_DEFAULT_PORT)==CURLUE_OK){
-            snprintf(entry,sizeof(entry),strchr(connect_ip,':')?"%s:%s:[%s]":"%s:%s:%s",host,port,connect_ip);resolve=curl_slist_append(resolve,entry);curl_easy_setopt(curl,CURLOPT_RESOLVE,resolve);}
-        curl_free(host);curl_free(port);curl_url_cleanup(u);}
+    char resolved_ip[256]={0};const char *connect_ip=textval(config,"api_connect_ip");
+    if(*connect_ip)snprintf(resolved_ip,sizeof(resolved_ip),strchr(connect_ip,':')?"[%s]":"%s",connect_ip);
+    else if(direct_mode){Addresses a;Error e={0};if(resolve_public("roskompozor.ru",&a,&e)){fprintf(stderr,"Temporary API error: direct DNS failed\n");return NULL;}size_t used=0;for(int i=0;i<a.count;i++)used+=(size_t)snprintf(resolved_ip+used,sizeof(resolved_ip)-used,strchr(a.ip[i],':')?"%s[%s]":"%s%s",i?",":"",a.ip[i]);}
+    if(*resolved_ip){char entry[320];snprintf(entry,sizeof(entry),"roskompozor.ru:443:%s",resolved_ip);resolve=curl_slist_append(NULL,entry);if(!resolve)return NULL;curl_easy_setopt(curl,CURLOPT_RESOLVE,resolve);}
     headers=curl_slist_append(headers,authorization);headers=curl_slist_append(headers,"Accept: application/json");if(payload)headers=curl_slist_append(headers,"Content-Type: application/json");
+    curl_easy_setopt(curl,CURLOPT_SOCKOPTFUNCTION,curl_mark);
     curl_easy_setopt(curl,CURLOPT_URL,url);curl_easy_setopt(curl,CURLOPT_HTTPHEADER,headers);curl_easy_setopt(curl,CURLOPT_USERAGENT,UA);curl_easy_setopt(curl,CURLOPT_TIMEOUT_MS,(long)(json_object_get_double(get(config,"request_timeout"))*1000));
     curl_easy_setopt(curl,CURLOPT_WRITEFUNCTION,api_write);curl_easy_setopt(curl,CURLOPT_WRITEDATA,&buffer);curl_easy_setopt(curl,CURLOPT_NOSIGNAL,1L);
     curl_easy_setopt(curl,CURLOPT_PROTOCOLS_STR,"http,https");curl_easy_setopt(curl,CURLOPT_PROXY,"");curl_easy_setopt(curl,CURLOPT_FOLLOWLOCATION,0L);
@@ -366,7 +438,7 @@ static J *api_request(J *config,const char *path,J *payload) {
     CURLcode code=curl_easy_perform(curl);long status=0;curl_easy_getinfo(curl,CURLINFO_RESPONSE_CODE,&status);J *reply=NULL;
     if(code==CURLE_OK&&status==200&&buffer.data){reply=parse_json(buffer.data,buffer.length);if(reply&&!json_object_is_type(reply,json_type_object)){json_object_put(reply);reply=NULL;}}
     if(!reply)fprintf(stderr,"Temporary API error: HTTP %ld; curl=%d; %s\n",status,(int)code,curl_easy_strerror(code));
-    free(buffer.data);curl_slist_free_all(headers);curl_slist_free_all(resolve);curl_easy_cleanup(curl);return reply;
+    free(buffer.data);curl_slist_free_all(headers);curl_slist_free_all(resolve);return reply;
 }
 static J *read_json_file(const char *path) {
     FILE *f=fopen(path,"rb");if(!f)return NULL;char *data=malloc(API_LIMIT+1);if(!data){fclose(f);return NULL;}size_t n=fread(data,1,API_LIMIT+1,f);bool bad=ferror(f)||n>API_LIMIT;fclose(f);J *o=bad?NULL:parse_json(data,n);free(data);return o;
@@ -378,13 +450,10 @@ static J *load_config(const char *path) {
     J *o=read_json_file(path);if(!o||!json_object_is_type(o,json_type_object))goto invalid;
     const char *key=textval(o,"api_key");if(strlen(key)<20||strlen(key)>128||strchr(key,'\r')||strchr(key,'\n'))goto invalid;
     J *connect=get(o,"api_connect_ip");if(connect){if(!json_object_is_type(connect,json_type_string))goto invalid;const char *ip=json_object_get_string(connect);unsigned char address[16];if(*ip&&inet_pton(AF_INET,ip,address)!=1&&inet_pton(AF_INET6,ip,address)!=1)goto invalid;}
-    CURLU *u=curl_url();char *scheme=NULL,*host=NULL,*user=NULL,*pass=NULL;bool bad=curl_url_set(u,CURLUPART_URL,textval(o,"server"),0)!=CURLUE_OK;
-    curl_url_get(u,CURLUPART_SCHEME,&scheme,0);curl_url_get(u,CURLUPART_HOST,&host,0);
-    bad=bad||!scheme||!host||(strcmp(scheme,"http")&&strcmp(scheme,"https"));
-    if(curl_url_get(u,CURLUPART_USER,&user,0)==CURLUE_OK||curl_url_get(u,CURLUPART_PASSWORD,&pass,0)==CURLUE_OK)bad=true;
-    curl_free(scheme);curl_free(host);curl_free(user);curl_free(pass);curl_url_cleanup(u);if(bad)goto invalid;
-    char *server=strdup(textval(o,"server"));size_t n=strlen(server);while(n&&server[n-1]=='/')server[--n]=0;str(o,"server",server);free(server);
-    if(number_config(o,"poll_interval",5,3600,true)||number_config(o,"request_timeout",2,60,false)||number_config(o,"max_parallel_checks",1,20,true))goto invalid;
+    /* Ignore legacy server settings, including on upgrades. */
+    json_object_object_del(o,"server");
+    if(number_config(o,"poll_interval",15,3600,true)||number_config(o,"request_timeout",2,60,false)||number_config(o,"max_parallel_checks",1,1,true))goto invalid;
+    J *direct=get(o,"direct_mode");if(direct&&!json_object_is_type(direct,json_type_boolean))goto invalid;direct_mode=direct?json_object_get_boolean(direct):true;
     return o;
 invalid:if(o)json_object_put(o);return NULL;
 }
@@ -392,6 +461,13 @@ typedef struct { J *item;J *result;double timeout; } CheckTask;
 static void *check_worker(void *arg) { CheckTask *t=arg;t->result=run_check(t->item,t->timeout);return NULL; }
 static void stop_signal(int sig) { (void)sig;stopping=1; }
 static void sleep_seconds(int seconds) { struct timespec t={seconds,0};while(!stopping&&nanosleep(&t,&t)<0&&errno==EINTR){} }
+/* Bounded retries; successful polls reset the backoff. */
+static int poll_delay(int interval,bool failed,int previous) {
+    if(!failed)return interval;
+    int delay=previous?previous*2:interval;
+    int cap=interval>300?interval:300;return delay>cap?cap:delay;
+}
+static void cleanup(void) { if(api_curl)curl_easy_cleanup(api_curl);if(dns_curl)curl_easy_cleanup(dns_curl);SSL_CTX_free(tls_context);curl_global_cleanup(); }
 static int initialize(void) {
     signal(SIGPIPE,SIG_IGN);signal(SIGTERM,stop_signal);signal(SIGINT,stop_signal);
     curl_global_init(CURL_GLOBAL_DEFAULT);tls_context=SSL_CTX_new(TLS_client_method());if(!tls_context)return -1;
@@ -403,11 +479,13 @@ static int initialize(void) {
 #ifndef PROBE_NO_MAIN
 int main(int argc,char **argv) {
     if(initialize()){fprintf(stderr,"TLS initialization failed\n");return 2;}
-    if(argc==3&&!strcmp(argv[1],"--validate-config")){J *c=load_config(argv[2]);if(!c){fprintf(stderr,"Invalid configuration\n");return 2;}json_object_put(c);SSL_CTX_free(tls_context);curl_global_cleanup();return 0;}
-    if(argc==3&&!strcmp(argv[1],"--check")){J *item=read_json_file(argv[2]);if(!item){fprintf(stderr,"Invalid check JSON\n");return 2;}J *r=run_check(item,10);puts(json_object_to_json_string_ext(r,JSON_C_TO_STRING_PLAIN));json_object_put(r);json_object_put(item);SSL_CTX_free(tls_context);curl_global_cleanup();return 0;}
+    if(argc==3&&!strcmp(argv[1],"--validate-config")){J *c=load_config(argv[2]);if(!c){fprintf(stderr,"Invalid configuration\n");return 2;}json_object_put(c);cleanup();return 0;}
+    if(argc==3&&!strcmp(argv[1],"--check-direct")){direct_mode=true;argv[1]="--check";}
+    if(argc==3&&!strcmp(argv[1],"--check")){J *item=read_json_file(argv[2]);if(!item){fprintf(stderr,"Invalid check JSON\n");return 2;}J *r=run_check(item,10);puts(json_object_to_json_string_ext(r,JSON_C_TO_STRING_PLAIN));json_object_put(r);json_object_put(item);cleanup();return 0;}
     bool once=argc>1&&!strcmp(argv[1],"--once");const char *path=once?(argc>2?argv[2]:"/etc/roskompozor-probe/config.json"):(argc>1?argv[1]:"/etc/roskompozor-probe/config.json");
     J *config=load_config(path);if(!config){fprintf(stderr,"Configuration error (check JSON and required fields)\n");return 2;}
     int parallel=json_object_get_int(get(config,"max_parallel_checks")),interval=json_object_get_int(get(config,"poll_interval"));double timeout=json_object_get_double(get(config,"request_timeout"));
+    int backoff=0;
     fprintf(stderr,"Native Probe started\n");
     do {
         J *reply=api_request(config,"/api/probe/checks",NULL),*checks=reply?get(reply,"checks"):NULL;bool failed=!reply||(checks&&!json_object_is_type(checks,json_type_array));
@@ -419,9 +497,10 @@ int main(int argc,char **argv) {
             for(size_t k=0;k<batch;k++){if(launched[k])pthread_join(threads[k],NULL);if(tasks[k].result){J *o=json_object_new_object();str(o,"check_id",json_object_get_string(get(tasks[k].item,"id")));put(o,"result",tasks[k].result);json_object_array_add(results,o);}}
         }
         if(json_object_array_length(results)&&!stopping){J *payload=json_object_new_object();put(payload,"results",results);results=NULL;J *ack=api_request(config,"/api/probe/results",payload);failed=!ack;if(ack){fprintf(stderr,"Submitted: accepted=%d duplicates=%d rejected=%d\n",json_object_get_int(get(ack,"accepted")),json_object_get_int(get(ack,"duplicates")),json_object_get_int(get(ack,"rejected")));json_object_put(ack);}json_object_put(payload);}
-        if(results)json_object_put(results);if(reply)json_object_put(reply);if(once){json_object_put(config);SSL_CTX_free(tls_context);curl_global_cleanup();return failed?1:0;}
-        if(!count||failed)sleep_seconds(interval);
+        if(results)json_object_put(results);if(reply)json_object_put(reply);if(once){json_object_put(config);cleanup();return failed?1:0;}
+        int delay=poll_delay(interval,failed,backoff);backoff=failed?delay:0;
+        sleep_seconds(delay);
     }while(!stopping);
-    json_object_put(config);SSL_CTX_free(tls_context);curl_global_cleanup();return 0;
+    json_object_put(config);cleanup();return 0;
 }
 #endif

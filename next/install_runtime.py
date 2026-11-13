@@ -16,6 +16,12 @@ def run(*args):
     subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
 
 
+def prepare_directory(path, mode):
+    path.mkdir(mode=mode, parents=True, exist_ok=True)
+    # mkdir's mode is filtered by the installer's restrictive umask.
+    os.chmod(path, mode)
+
+
 def install(source, supplied=None):
     if os.geteuid():
         raise RuntimeError('Run as root')
@@ -71,9 +77,9 @@ def install(source, supplied=None):
     if app.exists():
         # Queue/state are outside the program tree and are never copied/erased.
         shutil.copytree(app, backup / 'program', ignore=shutil.ignore_patterns('__pycache__'))
-    app.mkdir(mode=0o755, parents=True, exist_ok=True)
-    (app / 'next').mkdir(mode=0o755, exist_ok=True)
-    conf.mkdir(mode=0o750, exist_ok=True)
+    prepare_directory(app, 0o755)
+    prepare_directory(app / 'next', 0o755)
+    prepare_directory(conf, 0o750 if account else 0o700)
     old_active = False
     try:
         if systemd:
@@ -143,6 +149,8 @@ def install(source, supplied=None):
                   'assert r["accepted"]==r["duplicates"]==r["rejected"]==0')
         subprocess.run([sys.executable, '-c', verify], cwd=app / 'next', env=environment,
                        check=True, timeout=30, stdout=subprocess.DEVNULL)
+        if systemd:
+            run('systemctl', 'is-active', '--quiet', 'roskompozor-probe-next')
         if not config.get('keep_legacy'):
             if systemd:
                 subprocess.run(['systemctl', 'disable', '--now', 'roskompozor-probe'], check=False,

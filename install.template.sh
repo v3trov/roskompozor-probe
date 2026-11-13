@@ -3,7 +3,7 @@ set -eu
 umask 077
 [ "$(id -u)" = 0 ] || { echo 'Run as root.' >&2; exit 1; }
 dependencies_ready=0
-if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys,ssl,sqlite3,concurrent.futures,urllib.request,ipaddress; assert sys.version_info >= (3,9); assert ssl.create_default_context().get_ca_certs()' >/dev/null 2>&1; then
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys,ssl,os,sqlite3,concurrent.futures,urllib.request,ipaddress; assert sys.version_info >= (3,9); ssl.create_default_context(); v=ssl.get_default_verify_paths(); assert any(p and os.path.exists(p) for p in (v.cafile,v.capath))' >/dev/null 2>&1; then
     dependencies_ready=1
 fi
 if [ "$dependencies_ready" = 1 ]; then
@@ -34,7 +34,9 @@ export PROBE_INSTALL_STAGE="$stage"
 python3 - <<'BUNDLE'
 import base64,hashlib,io,os,pathlib,ssl,sys,tarfile
 assert sys.version_info >= (3,9),'Python 3.9+ required'
-assert ssl.create_default_context().get_ca_certs(),'CA certificates required'
+ssl.create_default_context()
+v=ssl.get_default_verify_paths()
+assert any(p and os.path.exists(p) for p in (v.cafile,v.capath)),'CA certificate store required'
 data=base64.b64decode('__BUNDLE_BASE64__')
 assert hashlib.sha256(data).hexdigest()=='__BUNDLE_SHA256__'
 root=pathlib.Path(os.environ['PROBE_INSTALL_STAGE'])

@@ -168,7 +168,7 @@ def install(source, supplied=None):
         elif systemd and old_active:
             subprocess.run(['systemctl', 'daemon-reload']); subprocess.run(['systemctl', 'start', 'roskompozor-probe-next'])
         raise
-    print(json.dumps({'installed': '2.0.0', 'service': 'roskompozor-probe-next', 'backup': str(backup), 'openwrt': router}))
+    print(json.dumps({'installed': '2.0.1', 'service': 'roskompozor-probe-next', 'backup': str(backup), 'openwrt': router}))
 
 
 if __name__ == '__main__':

@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import roskompozor_probe as legacy
 
-VERSION = '2.0.0'
+VERSION = '2.0.1'
 RESOLVERS = (
     ('cloudflare', '1.1.1.1', 'cloudflare-dns.com', '/dns-query'),
     ('google', '8.8.8.8', 'dns.google', '/dns-query'),
@@ -437,7 +437,7 @@ def direct_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         return _original_getaddrinfo(host, port, family, type, proto, flags)
     except ValueError:
         pass
-    port = int(port) if str(port).isdigit() else socket.getservbyname(port, 'tcp')
+    port = 0 if port is None else int(port) if str(port).isdigit() else socket.getservbyname(port, 'tcp')
     addresses = direct_addresses(host)
     rows = []
     for ip in addresses:

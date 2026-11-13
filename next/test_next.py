@@ -30,6 +30,12 @@ class NetworkTests(unittest.TestCase):
         with patch.object(net.subprocess, 'run', side_effect=net.subprocess.TimeoutExpired('dns', 4)):
             self.assertEqual(net.system_dns('example.org')['error_type'], 'timeout')
 
+    def test_direct_dns_supports_resolution_without_a_service_port(self):
+        with patch.object(net, 'direct_addresses', return_value=['1.1.1.1', '2606:4700:4700::1111']):
+            answers = net.direct_getaddrinfo('example.org', None, type=net.socket.SOCK_STREAM)
+        self.assertEqual(answers[0][4], ('1.1.1.1', 0))
+        self.assertEqual(answers[1][4], ('2606:4700:4700::1111', 0, 0, 0))
+
     def answer(self, rcode=0):
         ident, query = net.dns_packet('example.org', 1)
         header = struct.pack('!6H', ident, 0x8180 | rcode, 1, 1 if not rcode else 0, 0, 0)

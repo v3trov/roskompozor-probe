@@ -46,4 +46,4 @@ with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as archive:
   target.write_bytes(archive.extractfile(member).read())
 BUNDLE
 python3 "$stage/next/install_runtime.py"
-echo 'Probe 2.0 installed: roskompozor-probe-next'
+echo 'Probe 2.0.1 installed: roskompozor-probe-next'

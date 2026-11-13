@@ -6,6 +6,7 @@ import socket
 import socketserver
 import ssl
 import threading
+import time
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -35,14 +36,24 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     def __init__(self, address, context, allowed):
         self.context = context
         self.allowed = set(allowed)
+        self.rate = {}
         self.slots = threading.BoundedSemaphore(8)
         super().__init__(address, Handler)
 
     def get_request(self):
         stream, address = self.socket.accept()
-        if address[0] not in self.allowed:
+        if self.allowed and address[0] not in self.allowed:
             stream.close()
             raise ConnectionAbortedError('not a trial node')
+        now = time.monotonic()
+        tokens, stamp = self.rate.get(address[0], (12.0, now))
+        tokens = min(12.0, tokens + (now - stamp) * 6)
+        if len(self.rate) >= 1024 and address[0] not in self.rate:
+            self.rate.pop(next(iter(self.rate)))
+        self.rate[address[0]] = (max(0, tokens - 1), now)
+        if tokens < 1:
+            stream.close()
+            raise ConnectionAbortedError('control rate limit')
         stream.settimeout(4)
         return stream, address
 
@@ -74,7 +85,7 @@ if __name__ == '__main__':
     parser.add_argument('--key', required=True)
     parser.add_argument('--bind', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=443)
-    parser.add_argument('--allow', action='append', required=True)
+    parser.add_argument('--allow', action='append', default=[])
     args = parser.parse_args()
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2

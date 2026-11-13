@@ -27,6 +27,7 @@ return view.extend({
         catch (error) { throw new Error('Не удалось прочитать конфигурацию Probe. Проверьте config.json.'); }
         if (!config || typeof config !== 'object' || Array.isArray(config))
             throw new Error('Неверный формат конфигурации Probe.');
+        config = Object.assign({poll_interval: 5, request_timeout: 12}, config);
         this.original = config;
         this.enabled = data[2] === '1';
         var m = this.map = new form.JSONMap({probe: Object.assign({}, config, {enabled: this.enabled ? '1' : '0'})},
@@ -53,7 +54,7 @@ return view.extend({
         o.datatype = 'and(uinteger,range(5,3600))';
         o.rmempty = false;
         o = s.option(form.Value, 'request_timeout', 'Таймаут API, секунд');
-        o.datatype = 'range(2,60)';
+        o.datatype = 'range(2,30)';
         o.rmempty = false;
         o = s.option(form.Value, 'max_parallel_checks', 'Одновременных целей');
         o.datatype = 'and(uinteger,range(1,20))';

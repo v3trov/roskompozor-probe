@@ -1,0 +1,9 @@
+# Included inside inet fw4. Only Probe-created sockets carry bit 0x08000000.
+chain probe_direct_counter {
+    type filter hook output priority -149; policy accept;
+    meta mark & 0x08000000 != 0 counter
+}
+chain probe_local_api {
+    type nat hook output priority -101; policy accept;
+    meta mark & 0x08000000 != 0 ip daddr 37.194.95.150 tcp dport 443 counter dnat ip to 192.168.1.220:443
+}

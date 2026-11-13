@@ -1,409 +1,49 @@
 #!/bin/sh
 set -eu
 umask 077
-die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-say() { printf '%s\n' "$*"; }
-[ "$(uname -s)" = Linux ] || die 'Linux required.'
-[ "$(id -u)" = 0 ] || die 'Run this installer with sudo or as root.'
-if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
-    die 'An interactive terminal is required for the API key.'
+[ "$(id -u)" = 0 ] || { echo 'Run as root.' >&2; exit 1; }
+dependencies_ready=0
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys,ssl,sqlite3,concurrent.futures,urllib.request,ipaddress; assert sys.version_info >= (3,9); assert ssl.create_default_context().get_ca_certs()' >/dev/null 2>&1; then
+    dependencies_ready=1
 fi
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    init=systemd
-elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
-    init=openrc
-else
-    die 'Supported service managers: systemd and OpenRC. No changes made.'
-fi
-if command -v apt-get >/dev/null 2>&1; then
+if [ "$dependencies_ready" = 1 ]; then
+    :
+elif [ -r /etc/openwrt_release ]; then
+    available=$(df -Pk /overlay | awk 'NR==2 {print $4}')
+    [ "$available" -ge 18000 ] || { echo 'At least 18 MiB of free overlay space required.' >&2; exit 1; }
+    opkg update
+    opkg install python3 ca-bundle
+elif command -v apt-get >/dev/null 2>&1; then
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y python3 ca-certificates iputils-ping
+elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache python3 ca-certificates iputils shadow
 elif command -v dnf >/dev/null 2>&1; then
     dnf install -y python3 ca-certificates iputils
 elif command -v yum >/dev/null 2>&1; then
     yum install -y python3 ca-certificates iputils
-elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache python3 ca-certificates iputils
 elif command -v zypper >/dev/null 2>&1; then
     zypper --non-interactive install python3 ca-certificates iputils
 elif command -v pacman >/dev/null 2>&1; then
     pacman -S --needed --noconfirm python ca-certificates iputils
-else
-    say 'Unknown package manager: checking preinstalled dependencies.'
 fi
-command -v python3 >/dev/null 2>&1 || die 'Install Python 3.10 or newer.'
-command -v ping >/dev/null 2>&1 || die 'Install iputils ping.'
-python3 -c 'import sys,ssl; assert sys.version_info >= (3,10), "Python 3.10+ required"; assert ssl.create_default_context().get_ca_certs(), "CA certificates missing"'
+command -v python3 >/dev/null 2>&1 || { echo 'Python 3.9+ required.' >&2; exit 1; }
 stage=$(mktemp -d /tmp/roskompozor-install.XXXXXXXX)
 trap 'rm -rf -- "$stage"' EXIT HUP INT TERM
-chmod 755 "$stage"
-say 'Checking ICMP support...'
-ping -n -c 1 -W 2 127.0.0.1 >/dev/null 2>&1 || die 'ICMP unavailable: check container permissions / CAP_NET_RAW.'
-cat > "$stage/roskompozor_probe.py" <<'PROBE_SOURCE'
-#!/usr/bin/env python3
-"""Standard-library probe for roskompozor.ru decentralized diagnostics."""
-from __future__ import annotations
-import concurrent.futures
-import ipaddress
-import json
-import logging
-import re
-import shutil
-import socket
-import ssl
-import subprocess
-import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from pathlib import Path
-from typing import Any
-
-LOG = logging.getLogger("roskompozor-probe")
-USER_AGENT = "RoskompozorProbe/1.0.1"
-MAX_REDIRECTS = 5
-MAX_HEADER_BYTES = 65536
-
-def error_type(exc: BaseException) -> str:
-    if isinstance(exc, (TimeoutError, socket.timeout)): return "timeout"
-    if isinstance(exc, socket.gaierror): return "DNS error"
-    if isinstance(exc, ConnectionRefusedError): return "connection refused"
-    if isinstance(exc, ConnectionResetError): return "connection reset"
-    if isinstance(exc, ssl.SSLError): return "TLS error"
-    return "HTTP error" if isinstance(exc, ValueError) else "network error"
-
-def safe_error(exc: BaseException) -> str:
-    return f"{error_type(exc)}: {str(exc)[:240]}"
-
-def public_ip(value: str) -> bool:
-    try: address = ipaddress.ip_address(value)
-    except ValueError: return False
-    return address.is_global and not any((address.is_loopback,address.is_private,address.is_link_local,address.is_multicast,address.is_reserved,address.is_unspecified))
-
-def normalize_host(raw: str) -> str:
-    raw=raw.strip().rstrip(".")
-    if not raw or len(raw)>253 or any(ord(ch)<=32 for ch in raw): raise ValueError("invalid target")
-    try: return str(ipaddress.ip_address(raw))
-    except ValueError:
-        host=raw.encode("idna").decode("ascii").lower()
-        if not all(part and len(part)<=63 and part[0]!="-" and part[-1]!="-" and all(ch.isalnum() or ch=="-" for ch in part) for part in host.split(".")): raise ValueError("invalid target")
-        return host
-
-def resolve_public(host: str) -> list[str]:
-    try: addresses=[str(ipaddress.ip_address(host))]
-    except ValueError: addresses=sorted({item[4][0] for item in socket.getaddrinfo(host,None,type=socket.SOCK_STREAM)})
-    if not addresses: raise socket.gaierror("DNS returned no addresses")
-    if any(not public_ip(ip) for ip in addresses): raise ValueError("target resolved to a non-public address")
-    return addresses[:4]
-
-def tcp_check(ip: str,port: int,timeout: float) -> dict[str,Any]:
-    started=time.monotonic()
-    try:
-        with socket.create_connection((ip,port),timeout=timeout): return {"ok":True,"ms":round((time.monotonic()-started)*1000),"ip":ip}
-    except Exception as exc: return {"ok":False,"ms":round((time.monotonic()-started)*1000),"ip":ip,"error_type":error_type(exc),"error":safe_error(exc)}
-
-def best_tcp(addresses: list[str],port: int,timeout: float) -> dict[str,Any]:
-    attempts=[];good=None
-    for ip in addresses:
-        item=tcp_check(ip,port,timeout);attempts.append(item)
-        if item["ok"]: good=item;break
-    return {"ok":bool(good),"ms":(good or attempts[-1])["ms"],"attempts":attempts,**({"error":attempts[-1].get("error"),"error_type":attempts[-1].get("error_type")} if not good else {})}
-
-def ping_check(ip: str,timeout: float) -> dict[str,Any]:
-    started=time.monotonic();binary=shutil.which("ping")
-    if not binary: return {"ok":False,"ms":0,"ip":ip,"error_type":"unavailable","error":"ping utility is unavailable"}
-    command=[binary,"-n","-c","1","-W",str(max(1,int(timeout+0.999))),ip]
-    if ":" in ip: command.insert(1,"-6")
-    try:
-        completed=subprocess.run(command,capture_output=True,text=True,timeout=timeout+2,check=False)
-        output=(completed.stdout+" "+completed.stderr)[:4096];match=re.search(r"time[=<]([0-9.]+)\s*ms",output,re.I);elapsed=round((time.monotonic()-started)*1000)
-        return {"ok":completed.returncode==0,"ms":round(float(match.group(1))) if match else elapsed,"ip":ip,**({"error_type":"no reply","error":"No ICMP reply; ping may be disabled"} if completed.returncode else {})}
-    except Exception as exc: return {"ok":False,"ms":round((time.monotonic()-started)*1000),"ip":ip,"error_type":error_type(exc),"error":safe_error(exc)}
-
-def best_ping(addresses: list[str],timeout: float) -> dict[str,Any]:
-    attempts=[ping_check(ip,timeout) for ip in addresses];good=next((item for item in attempts if item["ok"]),None)
-    return {"ok":bool(good),"ms":(good or attempts[-1])["ms"],"attempts":attempts,**({"error":attempts[-1].get("error"),"error_type":attempts[-1].get("error_type")} if not good else {})}
-
-def tls_check(host: str,addresses: list[str],timeout: float) -> dict[str,Any]:
-    attempts=[];context=ssl.create_default_context()
-    for ip in addresses:
-        started=time.monotonic()
-        try:
-            with socket.create_connection((ip,443),timeout=timeout) as plain:
-                with context.wrap_socket(plain,server_hostname=host) as secure: cert=secure.getpeercert()
-            subject=dict(part[0] for part in cert.get("subject",())).get("commonName");item={"ok":True,"ms":round((time.monotonic()-started)*1000),"ip":ip,"subject":subject,"expires":cert.get("notAfter")};attempts.append(item);return {**item,"attempts":attempts}
-        except Exception as exc: attempts.append({"ok":False,"ms":round((time.monotonic()-started)*1000),"ip":ip,"error_type":error_type(exc),"error":safe_error(exc)})
-    return {**attempts[-1],"attempts":attempts}
-
-def parse_url(url: str) -> tuple[str,str,int,str]:
-    parts=urllib.parse.urlsplit(url)
-    if parts.scheme not in ("http","https") or not parts.hostname or parts.username or parts.password: raise ValueError("unsafe URL")
-    port=parts.port or (443 if parts.scheme=="https" else 80)
-    if port not in (80,443): raise ValueError("unsafe port")
-    host=normalize_host(parts.hostname);path=urllib.parse.urlunsplit(("","",parts.path or "/",parts.query,""));return parts.scheme,host,port,path
-
-def remaining_timeout(deadline: float,cap: float) -> float:
-    remaining=deadline-time.monotonic()
-    if remaining<=0: raise TimeoutError('HTTP deadline exceeded')
-    return min(cap,remaining)
-
-def http_once(url: str,timeout: float,deadline: float|None=None) -> dict[str,Any]:
-    deadline=min(deadline if deadline is not None else float('inf'),time.monotonic()+timeout)
-    scheme,host,port,path=parse_url(url);addresses=resolve_public(host);last=None
-    for ip in addresses:
-        started=time.monotonic();connection=None
-        try:
-            connection=socket.create_connection((ip,port),timeout=remaining_timeout(deadline,timeout))
-            connection.settimeout(remaining_timeout(deadline,timeout))
-            if scheme=="https": connection=ssl.create_default_context().wrap_socket(connection,server_hostname=host)
-            host_header=f"[{host}]" if ":" in host else host
-            request=f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n\r\n";connection.settimeout(remaining_timeout(deadline,timeout));connection.sendall(request.encode("ascii"));data=b""
-            while b"\r\n\r\n" not in data and len(data)<MAX_HEADER_BYTES:
-                connection.settimeout(remaining_timeout(deadline,timeout))
-                chunk=connection.recv(4096)
-                if not chunk: break
-                data+=chunk
-            header=data.split(b"\r\n\r\n",1)[0].decode("iso-8859-1");lines=header.split("\r\n")
-            if not lines or len(lines[0].split())<2: raise ValueError("invalid HTTP response")
-            status=int(lines[0].split()[1]);headers={key.strip().lower():value.strip() for key,value in (line.split(":",1) for line in lines[1:] if ":" in line)}
-            return {"ok":True,"status":status,"ms":round((time.monotonic()-started)*1000),"ip":ip,"location":headers.get("location")}
-        except Exception as exc:
-            last={"ok":False,"status":0,"ms":round((time.monotonic()-started)*1000),"ip":ip,"error_type":error_type(exc),"error":safe_error(exc)}
-            if time.monotonic()>=deadline: break
-        finally:
-            if connection is not None: connection.close()
-    return last or {"ok":False,"status":0,"ms":0,"error_type":"network error","error":"No public address"}
-
-def http_chain(initial: str,timeout: float) -> dict[str,Any]:
-    url=initial;chain=[];deadline=time.monotonic()+timeout*(MAX_REDIRECTS+1)
-    for redirect_count in range(MAX_REDIRECTS+1):
-        result=http_once(url,timeout,deadline);result["url"]=url;chain.append(result);location=result.get("location")
-        if not location or result.get("status") not in (301,302,303,307,308): break
-        if redirect_count>=MAX_REDIRECTS: break
-        url=urllib.parse.urljoin(url,location);parse_url(url)
-    last=chain[-1]
-    return {"ok":bool(last.get("ok")),"status":last.get("status",0),"ms":sum(int(item.get("ms",0)) for item in chain),"final_url":url,"chain":chain,**({"error":last.get("error"),"error_type":last.get("error_type")} if not last.get("ok") else {})}
-
-def run_check(item: dict[str,Any],timeout: float) -> dict[str,Any]:
-    started=time.monotonic()
-    try:
-        host=normalize_host(str(item.get("target","")));expected="ip" if public_ip(host) else "domain"
-        if item.get("type")!=expected: raise ValueError("target type mismatch")
-        raw_ports=item.get("ports",[]);ports=[]
-        if not isinstance(raw_ports,list) or len(raw_ports)>8: raise ValueError("invalid ports")
-        for raw_port in raw_ports:
-            if isinstance(raw_port,bool) or not isinstance(raw_port,int) or raw_port<1 or raw_port>65535: raise ValueError("invalid port")
-            if raw_port not in ports: ports.append(raw_port)
-        ports=list(dict.fromkeys([80,443,*ports]));dns_started=time.monotonic();addresses=resolve_public(host);dns={"ok":True,"a":[ip for ip in addresses if ":" not in ip],"aaaa":[ip for ip in addresses if ":" in ip],"ms":round((time.monotonic()-dns_started)*1000)}
-        check_timeout=min(timeout,3.0);ping=best_ping(addresses,min(check_timeout,2.0));tcp={}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(ports),10)) as port_executor:
-            port_futures={port_executor.submit(best_tcp,addresses,port,min(check_timeout,2.0)):port for port in ports}
-            for future,port in port_futures.items(): tcp[str(port)]=future.result()
-        tls=tls_check(host,addresses,check_timeout) if tcp["443"]["ok"] else {"ok":False,"ms":0,"error_type":"connection refused","error":"TCP 443 is closed or filtered","attempts":[]}
-        literal=f"[{host}]" if ":" in host else host
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as web_executor:
-            http_future=web_executor.submit(http_chain,f"http://{literal}/",check_timeout);https_future=web_executor.submit(http_chain,f"https://{literal}/",check_timeout)
-            http=http_future.result();https=https_future.result()
-        ok=bool(tcp["80"]["ok"] or tcp["443"]["ok"] or http["ok"] or https["ok"])
-        return {"ok":ok or ping["ok"],"target_type":expected,"summary":"Узел получил сетевой ответ" if ok or ping["ok"] else "Ответ на проверенные запросы не получен","dns":dns,"ping":ping,"tcp":tcp,"tls":tls,"http":http,"https":https,"total_ms":round((time.monotonic()-started)*1000)}
-    except Exception as exc: return {"ok":False,"summary":"Проверка завершилась технической ошибкой","error_type":error_type(exc),"error":safe_error(exc),"total_ms":round((time.monotonic()-started)*1000)}
-
-class ApiClient:
-    def __init__(self,server: str,api_key: str,timeout: float):
-        parts=urllib.parse.urlsplit(server)
-        if parts.scheme not in ("http","https") or not parts.hostname or parts.username or parts.password: raise ValueError("invalid server URL")
-        self.server=server.rstrip("/");self.api_key=api_key;self.timeout=timeout
-    def request(self,path: str,payload: dict[str,Any]|None=None) -> dict[str,Any]:
-        body=None if payload is None else json.dumps(payload,ensure_ascii=False,separators=(",",":")).encode();headers={"Authorization":f"Bearer {self.api_key}","Accept":"application/json","User-Agent":USER_AGENT}
-        if body is not None: headers["Content-Type"]="application/json"
-        request=urllib.request.Request(self.server+path,data=body,method="GET" if body is None else "POST",headers=headers)
-        with urllib.request.urlopen(request,timeout=self.timeout) as response:
-            if response.status!=200: raise RuntimeError(f"API HTTP {response.status}")
-            data=json.loads(response.read(1048577))
-        if not isinstance(data,dict): raise ValueError("invalid API response")
-        return data
-
-def load_config(path: Path) -> dict[str,Any]:
-    config=json.loads(path.read_text(encoding="utf-8"));required=("server","api_key","poll_interval","request_timeout","max_parallel_checks")
-    if not isinstance(config,dict) or any(key not in config for key in required): raise ValueError("incomplete configuration")
-    if not isinstance(config["api_key"],str) or len(config["api_key"])<20: raise ValueError("invalid api_key")
-    config["poll_interval"]=max(5,min(3600,int(config["poll_interval"])));config["request_timeout"]=max(2,min(60,float(config["request_timeout"])));config["max_parallel_checks"]=max(1,min(20,int(config["max_parallel_checks"])));return config
-
-def main() -> int:
-    logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s");path=Path(sys.argv[1] if len(sys.argv)>1 else Path(__file__).with_name("config.json"))
-    try: config=load_config(path);client=ApiClient(config["server"],config["api_key"],config["request_timeout"])
-    except Exception as exc: LOG.error("Configuration error: %s",safe_error(exc));return 2
-    LOG.info("Probe started for %s",config["server"])
-    while True:
-        try:
-            checks=client.request("/api/probe/checks").get("checks",[])
-            if not isinstance(checks,list): raise ValueError("invalid checks response")
-            if not checks: time.sleep(config["poll_interval"]);continue
-            LOG.info("Received %d checks",len(checks));results=[]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=config["max_parallel_checks"]) as executor:
-                futures={executor.submit(run_check,item,config["request_timeout"]):item for item in checks if isinstance(item,dict) and "id" in item}
-                for future,item in futures.items():
-                    try: result=future.result()
-                    except Exception as exc: result={"ok":False,"summary":"Внутренняя ошибка узла","error_type":error_type(exc),"error":safe_error(exc)}
-                    results.append({"check_id":str(item["id"]),"result":result})
-            if results:
-                reply=client.request("/api/probe/results",{"results":results});LOG.info("Submitted: accepted=%s duplicates=%s rejected=%s",reply.get("accepted",0),reply.get("duplicates",0),reply.get("rejected",0))
-        except (urllib.error.URLError,urllib.error.HTTPError,TimeoutError,OSError,ValueError,RuntimeError,json.JSONDecodeError) as exc: LOG.warning("Temporary API error: %s",safe_error(exc));time.sleep(config["poll_interval"])
-        except KeyboardInterrupt: LOG.info("Probe stopped");return 0
-
-if __name__=="__main__": raise SystemExit(main())
-PROBE_SOURCE
-chmod 644 "$stage/roskompozor_probe.py"
-python3 - "$stage" <<'PY'
-import getpass, importlib.util, json, pathlib, re, sys, urllib.error, urllib.request
-root = pathlib.Path(sys.argv[1])
-source = root / 'roskompozor_probe.py'
-compile(source.read_bytes(), str(source), 'exec')
-spec = importlib.util.spec_from_file_location('probe', source)
-probe = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(probe)
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
-with open('/dev/tty', 'w') as tty:
-    key = getpass.getpass('API key (input hidden): ', stream=tty).strip()
-    if not re.fullmatch(r'rkp_[0-9a-fA-F]{64}', key):
-        sys.exit('Invalid API key format. Expected rkp_ and 64 hexadecimal characters.')
-    config = dict(server='https://roskompozor.ru', api_key=key, poll_interval=10,
-                  request_timeout=10, max_parallel_checks=3)
-    request = urllib.request.Request(config['server'] + '/api/probe/results',
-        data=b'{"results":[]}', method='POST', headers={
-        'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json',
-        'User-Agent': probe.USER_AGENT})
-    try:
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=20) as response:
-            data = json.load(response)
-        if not isinstance(data, dict) or not all(k in data for k in ('accepted','duplicates','rejected')):
-            raise ValueError('Unexpected API response')
-    except urllib.error.HTTPError as exc:
-        sys.exit('API validation failed: HTTP %s. Check key and whether the node is enabled.' % exc.code)
-    except Exception as exc:
-        sys.exit('API validation failed (%s). Check DNS, HTTPS, certificates and system clock.' % type(exc).__name__)
-    (root / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
-    probe.load_config(root / 'config.json')
-print('API key and HTTPS connection verified; no jobs claimed.')
-PY
-app=/opt/roskompozor-probe
-conf=/etc/roskompozor-probe
-name=roskompozor-probe
-python=$(command -v python3)
-if ! id "$name" >/dev/null 2>&1; then
-    if command -v useradd >/dev/null 2>&1; then
-        useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /bin/false "$name"
-    else
-        addgroup -S "$name"
-        adduser -S -D -H -h /nonexistent -s /bin/false -G "$name" "$name"
-    fi
-fi
-group=$(id -gn "$name")
-cat > "$stage/roskompozor-probe.service" <<EOF
-[Unit]
-Description=Roskompozor Probe
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-User=$name
-Group=$group
-WorkingDirectory=$app
-ExecStart=$python $app/roskompozor_probe.py $conf/config.json
-Restart=always
-RestartSec=10
-Environment=PYTHONDONTWRITEBYTECODE=1
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-LockPersonality=true
-CapabilityBoundingSet=CAP_NET_RAW
-AmbientCapabilities=CAP_NET_RAW
-UMask=0077
-[Install]
-WantedBy=multi-user.target
-EOF
-cat > "$stage/openrc" <<EOF
-#!/sbin/openrc-run
-name="Roskompozor Probe"
-command="$python"
-command_args="$app/roskompozor_probe.py $conf/config.json"
-command_user="$name:$group"
-supervisor="supervise-daemon"
-respawn_delay=10
-respawn_max=0
-retry="TERM/10/KILL/5"
-output_log="/var/log/roskompozor-probe.log"
-error_log="/var/log/roskompozor-probe.log"
-capabilities="^cap_net_raw"
-depend() { need net; }
-EOF
-if [ "$init" = systemd ]; then
-    systemd-analyze verify "$stage/roskompozor-probe.service"
-    systemd-run --quiet --wait --pipe --collect -p "User=$name" -p NoNewPrivileges=yes -p AmbientCapabilities=CAP_NET_RAW -p CapabilityBoundingSet=CAP_NET_RAW ping -n -c 1 -W 2 127.0.0.1 >/dev/null || die 'Service user cannot use ping.'
-else
-    command -v supervise-daemon >/dev/null 2>&1 || die 'OpenRC supervise-daemon required.'
-    if ! supervise-daemon --help 2>&1 | grep -q -- '--capabilities'; then
-        # Some distributions build OpenRC without libcap support. Their iputils
-        # can instead use unprivileged ICMP sockets or its packaged file capability.
-        su -s /bin/sh "$name" -c 'ping -n -c 1 -W 2 127.0.0.1' >/dev/null 2>&1 || die 'OpenRC has no capabilities support and unprivileged ping failed. Enable ICMP ping sockets for the service group.'
-        sed '/^capabilities=/d' "$stage/openrc" > "$stage/openrc.tmp"
-        mv "$stage/openrc.tmp" "$stage/openrc"
-    fi
-fi
-backup=/var/backups/roskompozor-probe/$(date +%Y%m%d-%H%M%S)-$$
-mkdir -p "$backup"
-chmod 700 "$backup"
-for path in "$app/roskompozor_probe.py" "$conf/config.json" /etc/systemd/system/roskompozor-probe.service /etc/init.d/roskompozor-probe; do
-    if [ -e "$path" ]; then
-        mkdir -p "$backup$(dirname "$path")"
-        cp -p "$path" "$backup$path"
-    fi
-done
-mkdir -p "$app" "$conf"
-chmod 755 "$app"
-chown root:"$group" "$conf"
-chmod 750 "$conf"
-install -m 644 "$stage/roskompozor_probe.py" "$app/roskompozor_probe.py"
-install -m 640 "$stage/config.json" "$conf/config.json"
-chown root:"$group" "$conf/config.json"
-if [ "$init" = systemd ]; then
-    install -m 644 "$stage/roskompozor-probe.service" /etc/systemd/system/roskompozor-probe.service
-    systemctl daemon-reload
-    systemctl enable "$name"
-    systemctl restart "$name"
-    sleep 3
-    systemctl is-active --quiet "$name" || die "Service failed. Backup: $backup; inspect journalctl -u $name"
-else
-    if [ ! -e /var/log/roskompozor-probe.log ]; then
-        touch /var/log/roskompozor-probe.log
-    fi
-    chown "$name:$group" /var/log/roskompozor-probe.log
-    chmod 640 /var/log/roskompozor-probe.log
-    install -m 755 "$stage/openrc" /etc/init.d/roskompozor-probe
-    rc-update add "$name" default
-    rc-service "$name" restart
-    sleep 3
-    rc-service "$name" status || die "Service failed. Backup: $backup"
-fi
-python3 - "$app/roskompozor_probe.py" <<'PY'
-import pathlib, sys
-target = sys.argv[1].encode()
-for process in pathlib.Path('/proc').glob('[0-9]*/cmdline'):
-    try:
-        if target in process.read_bytes().split(b'\0')[1:2]:
-            break
-    except OSError:
-        continue
-else:
-    sys.exit('Probe process not running. Inspect the service log and backup before retrying.')
-PY
-say "Probe installed and running. Backup: $backup"
+export PROBE_INSTALL_STAGE="$stage"
+python3 - <<'BUNDLE'
+import base64,hashlib,io,os,pathlib,ssl,sys,tarfile
+assert sys.version_info >= (3,9),'Python 3.9+ required'
+assert ssl.create_default_context().get_ca_certs(),'CA certificates required'
+data=base64.b64decode('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')
+assert hashlib.sha256(data).hexdigest()=='2db3d2c1a2f8f3e56d835d1dc8d5d49e757f408f65f661c4a619d6a0c4918853'
+root=pathlib.Path(os.environ['PROBE_INSTALL_STAGE'])
+with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as archive:
+ for member in archive:
+  path=pathlib.PurePosixPath(member.name)
+  assert member.isfile() and not path.is_absolute() and '..' not in path.parts
+  target=root.joinpath(*path.parts);target.parent.mkdir(parents=True,exist_ok=True)
+  target.write_bytes(archive.extractfile(member).read())
+BUNDLE
+python3 "$stage/next/install_runtime.py"
+echo 'Probe 2.0 installed: roskompozor-probe-next'

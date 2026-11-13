@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+# shellcheck disable=SC2034
+name="Roskompozor Probe"
+command="/usr/bin/python3"
+command_args="/opt/roskompozor-probe-next/next/probe_next.py /etc/roskompozor-probe-next/config.json"
+command_user="roskompozor-probe-next:roskompozor-probe-next"
+supervisor="supervise-daemon"
+respawn_delay=10
+output_log="/var/log/roskompozor-probe-next.log"
+error_log="/var/log/roskompozor-probe-next.log"
+depend() { need net; }
+start_pre() {
+    checkpath --directory --owner roskompozor-probe-next:roskompozor-probe-next --mode 0700 /var/lib/roskompozor-probe-next
+}

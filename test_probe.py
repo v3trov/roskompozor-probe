@@ -29,10 +29,13 @@ class ProbeTests(unittest.TestCase):
             self.assertIn('invalid port', result['error'])
 
     def test_embedded_source_matches(self):
+        import ast,base64,io,re,tarfile
         root = pathlib.Path(__file__).parent
-        installer = (root / 'install.sh').read_bytes()
-        embedded = installer.split(b"<<'PROBE_SOURCE'\n", 1)[1].split(b'\nPROBE_SOURCE\n', 1)[0]
-        self.assertEqual(embedded + b'\n', (root / 'roskompozor_probe.py').read_bytes())
+        installer = (root / 'install.sh').read_text()
+        data = base64.b64decode(ast.literal_eval(re.search(r'data=base64.b64decode\(([^\n]+)\)',installer).group(1)))
+        with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as archive:
+            self.assertEqual(archive.extractfile('roskompozor_probe.py').read(),(root/'roskompozor_probe.py').read_bytes())
+
 
 
 if __name__ == '__main__':

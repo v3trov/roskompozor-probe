@@ -1,0 +1,33 @@
+[Unit]
+Description=Roskompozor Probe 2.0
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=roskompozor-probe-next
+Group=roskompozor-probe-next
+WorkingDirectory=/opt/roskompozor-probe-next/next
+ExecStart=/usr/bin/python3 /opt/roskompozor-probe-next/next/probe_next.py /etc/roskompozor-probe-next/config.json
+StateDirectory=roskompozor-probe-next
+StateDirectoryMode=0700
+Environment=PYTHONDONTWRITEBYTECODE=1
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+MemoryMax=160M
+TasksMax=96
+CPUQuota=40%
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -13,3 +13,7 @@ jobs:
       - run: sh -n openwrt/files/roskompozor-probe.init
       - run: shellcheck -s sh openwrt/files/roskompozor-probe.init openwrt/tests/run.sh luci-app-roskompozor-probe/files/config-helper
       - run: node openwrt/tests/test_luci.cjs
+      - run: python3 -m unittest discover -s next -p 'test_*.py' -v
+      - run: python3 build_installer.py && git diff --exit-code -- install.sh
+      - run: sh -n next/openwrt.init && sh -n next/luci-helper
+      - run: shellcheck -s sh next/openwrt.init next/openrc.init next/luci-helper

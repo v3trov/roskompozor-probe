@@ -1,29 +1,32 @@
+# Roskompozor Probe 2.0
+
 ```sh
 t=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/v3trov/roskompozor-probe/main/install.sh -o "$t" && sudo sh "$t"; rm -f "$t"
 ```
 
-От root: замените `sudo sh` на `sh`.
-
-Linux с systemd или OpenRC, Python 3.10+. Armbian поддерживается.
-API-ключ вводится интерактивно, ввод скрыт. Для каждого узла нужен отдельный ключ.
+От root: замените `sudo sh` на `sh`. OpenWrt 24.10 с opkg поддерживается этим же
+установщиком. Linux: systemd или OpenRC, Python 3.9+. Недостающие зависимости
+устанавливаются автоматически. API-ключ вводится скрыто; каждому узлу нужен
+отдельный ключ из админки сайта. При обновлении существующий ключ сохраняется.
 
 ```sh
-systemctl status roskompozor-probe
-journalctl -u roskompozor-probe -f
+systemctl status roskompozor-probe-next
+journalctl -u roskompozor-probe-next -f
 ```
 
-OpenRC: `rc-service roskompozor-probe status`.
-Журнал OpenRC: `/var/log/roskompozor-probe.log`.
+OpenWrt: `/etc/init.d/roskompozor-probe-next status`, журнал — `logread`.
+OpenRC: `rc-service roskompozor-probe-next status`.
 
-Конфигурация: `/etc/roskompozor-probe/config.json` (root и группа службы, `0640`).
-Резервные копии при переустановке: `/var/backups/roskompozor-probe/` (root, `0700`).
-Повторный запуск установщика обновляет код и запрашивает ключ заново.
+Конфигурация: `/etc/roskompozor-probe-next/config.json`. Резервные копии:
+`/var/backups/roskompozor-probe-next/`, на OpenWrt —
+`/etc/roskompozor-probe-next-backups/`. Старый клиент останавливается после
+проверки нового ключа через API. История очереди нового клиента сохраняется.
 
-Нестандартный init, Python старше 3.10 и контейнеры без необходимых прав ICMP
-не поддерживаются автоматически: установщик завершится с объяснением.
+OpenWrt использует тот же Python-движок и формат отчётов. Для ZeroBlock задаётся
+метка только сокетам Probe; DNS измеряется напрямую. Если в прежней конфигурации
+был задан `api_connect_ip`, локальный доступ к серверу API сохраняется.
+Существующий интерфейс LuCI обновляется вместе с клиентом.
 
-## OpenWrt
-
-Нативный пакет для OpenWrt/RouteRich 24.10, aarch64_cortex-a53: [OpenWrt 1.0.1-r1](https://github.com/v3trov/roskompozor-probe/releases/tag/openwrt-v1.0.1-r1).
-Обновляется только пакет roskompozor-probe; существующий LuCI и config.json сохраняются.
-Исходники и сборка: [openwrt/](openwrt/).
+Подробности реализации и тесты: [next/README.md](next/README.md).
+Старые native-пакеты в `openwrt/` и прежних релизах относятся к версии 1.x;
+для новых узлов используйте установщик выше.
